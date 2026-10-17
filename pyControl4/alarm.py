@@ -14,7 +14,8 @@ from pyControl4.director import C4Director
 class C4ZoneType(IntEnum):
     """Control4 security zone types.
 
-    These correspond to the type_id values returned by GET_ZONE_LIST.
+    These correspond to type_id values observed in the mobile app API.
+    Driver support varies; callers must handle unknown IDs.
     """
 
     UNKNOWN = 0
@@ -33,7 +34,7 @@ class C4ZoneType(IntEnum):
     GLASS_BREAK = 13
     GATE = 14
     GARAGE = 15
-    COLD = 16
+    COLD = 16  # Observed in the mobile app; not in the published 0-15 proxy list.
 
     @classmethod
     def get_name(cls, type_id: int) -> str:
@@ -269,7 +270,8 @@ class C4SecurityPanel(C4Entity):
     async def get_zones(self) -> list[dict] | None:
         """Returns a list of all security zones for this partition.
 
-        Each zone is a dictionary with the following keys:
+        Returns None for unsupported or malformed responses, [] for no zones.
+        Fields vary by driver; commonly observed keys include:
             - `id` (int): Zone ID
             - `name` (str): Zone name
             - `room_id` (int): Room ID where the zone is located
@@ -287,18 +289,7 @@ class C4SecurityPanel(C4Entity):
             {},
             is_async=False,
         )
-        if result:
-            try:
-                data = json.loads(result)
-                zones = data.get("zones", {})
-                # Handle both list and single zone response
-                zone_list = zones.get("zone", [])
-                if isinstance(zone_list, dict):
-                    zone_list = [zone_list]
-                return zone_list
-            except (json.JSONDecodeError, AttributeError):
-                return None
-        return None
+        return self._parse_zones(result)
 
     async def get_open_zones(self) -> list[dict] | None:
         """Returns a list of only open (unsecured) zones for this partition.
@@ -312,17 +303,34 @@ class C4SecurityPanel(C4Entity):
             {},
             is_async=False,
         )
-        if result:
-            try:
-                data = json.loads(result)
-                zones = data.get("zones", {})
-                zone_list = zones.get("zone", [])
-                if isinstance(zone_list, dict):
-                    zone_list = [zone_list]
-                return zone_list
-            except (json.JSONDecodeError, AttributeError):
-                return None
-        return None
+        return self._parse_zones(result)
+
+    @staticmethod
+    def _parse_zones(result: str) -> list[dict] | None:
+        """Distinguish a valid empty list from an unsupported/malformed reply.
+
+        Fields other than id are driver-dependent and retained unchanged.
+        A single zone object and null (no zones) are valid wire formats.
+        """
+        try:
+            data = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(data, dict) or "zones" not in data:
+            return None
+        container = data["zones"]
+        if not isinstance(container, dict) or "zone" not in container:
+            return None
+        zones = container["zone"]
+        if zones is None:
+            return []
+        if isinstance(zones, dict):
+            zones = [zones]
+        if not isinstance(zones, list):
+            return None
+        if any(not isinstance(zone, dict) or "id" not in zone for zone in zones):
+            return None
+        return zones
 
 
 class C4ContactSensor:

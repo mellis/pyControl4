@@ -112,8 +112,7 @@ async def test_get_zones_no_zones_key(director):
         panel = C4SecurityPanel(director, 500)
         zones = await panel.get_zones()
 
-    assert zones is not None
-    assert len(zones) == 0
+    assert zones is None
 
 
 @pytest.mark.asyncio
@@ -224,3 +223,35 @@ class TestC4ZoneType:
         """Test get_name returns default for unknown types."""
         assert C4ZoneType.get_name(99) == "Security Zone"
         assert C4ZoneType.get_name(-1) == "Security Zone"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_zones", "get_open_zones"])
+@pytest.mark.parametrize(
+    "response",
+    [
+        "null",
+        "[]",
+        '{"zones": null}',
+        '{"zones": {"zone": 1}}',
+        '{"zones": {"zone": [null]}}',
+        '{"zones": {"zone": [{}]}}',
+        "",
+    ],
+)
+async def test_invalid_response_is_not_an_empty_snapshot(director, method, response):
+    with patch.object(
+        director, "send_post_request", new=AsyncMock(return_value=response)
+    ):
+        assert await getattr(C4SecurityPanel(director, 500), method)() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["get_zones", "get_open_zones"])
+async def test_null_zone_means_empty_list(director, method):
+    with patch.object(
+        director,
+        "send_post_request",
+        new=AsyncMock(return_value='{"zones":{"zone":null}}'),
+    ):
+        assert await getattr(C4SecurityPanel(director, 500), method)() == []
