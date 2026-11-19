@@ -19,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 _NAMESPACE_URI = "/api/v1/items/datatoui"
 _PROBE_MESSAGE = "2probe"
 _STATUS_ACK_MESSAGE = "2"
+_SUBSCRIPTION_TIMEOUT = 60
 
 
 class _C4DirectorNamespace(socketio.AsyncClientNamespace):  # type: ignore[misc]
@@ -27,6 +28,7 @@ class _C4DirectorNamespace(socketio.AsyncClientNamespace):  # type: ignore[misc]
         self.token: str = kwargs.pop("token")
         self.callback: Callable[..., Any] = kwargs.pop("callback")
         self.session: aiohttp.ClientSession | None = kwargs.pop("session")
+        self.ready: asyncio.Future[None] = kwargs.pop("ready")
         self.connect_callback: Callable[..., Any] | None = kwargs.pop(
             "connect_callback"
         )
@@ -40,12 +42,14 @@ class _C4DirectorNamespace(socketio.AsyncClientNamespace):  # type: ignore[misc]
 
     async def on_connect(self) -> None:
         _LOGGER.debug("Control4 Director socket.io connection established!")
-        if self.connect_callback is not None:
-            await self.connect_callback()
 
     async def on_disconnect(self) -> None:
         self.connected = False
         self.subscription_id = None
+        if not self.ready.done():
+            self.ready.set_exception(
+                ConnectionError("Disconnected before subscription was ready")
+            )
         _LOGGER.debug("Control4 Director socket.io disconnected.")
         if self.disconnect_callback is not None:
             await self.disconnect_callback()
@@ -68,6 +72,21 @@ class _C4DirectorNamespace(socketio.AsyncClientNamespace):  # type: ignore[misc]
                 await self.callback(args[0])
 
     async def on_clientId(self, client_id: str) -> None:
+        try:
+            await self._subscribe(client_id)
+        except Exception as exception:
+            if not self.ready.done():
+                # This handler runs in Socket.IO's background task. Deliver the
+                # failure to sio_connect(), where callers can retry it.
+                self.ready.set_exception(exception)
+            else:
+                _LOGGER.warning(
+                    "Control4 resubscription failed (%s)", type(exception).__name__
+                )
+                if self.disconnect_callback is not None:
+                    await self.disconnect_callback()
+
+    async def _subscribe(self, client_id: str) -> None:
         await self.emit(_PROBE_MESSAGE)
         if not self.connected and not self.subscription_id:
             _LOGGER.debug("Fetching subscriptionID from Control4")
@@ -90,6 +109,12 @@ class _C4DirectorNamespace(socketio.AsyncClientNamespace):  # type: ignore[misc]
                         self.connected = True
                         self.subscription_id = subscription_id
                         await self.emit("startSubscription", self.subscription_id)
+                # A transport connection alone does not authenticate the token.
+                # Restore entity state only after subscription authentication.
+                if self.connect_callback is not None:
+                    await self.connect_callback()
+                if not self.ready.done():
+                    self.ready.set_result(None)
             finally:
                 if self.session is None:
                     await session.close()
@@ -218,8 +243,10 @@ class C4Websocket:
             self._sio = socketio.AsyncClient(ssl_verify=True, http_session=http_session)
         else:
             self._sio = socketio.AsyncClient(ssl_verify=False)
+        ready = asyncio.get_running_loop().create_future()
         self._sio.register_namespace(
             _C4DirectorNamespace(
+                ready=ready,
                 token=director_bearer_token,
                 url=self.base_url,
                 callback=self._callback,
@@ -228,11 +255,23 @@ class C4Websocket:
                 disconnect_callback=self.disconnect_callback,
             )
         )
-        await self._sio.connect(
-            self.wss_url,
-            transports=["websocket"],
-            headers={"JWT": director_bearer_token},
-        )
+        try:
+            async with asyncio.timeout(_SUBSCRIPTION_TIMEOUT):
+                await self._sio.connect(
+                    self.wss_url,
+                    transports=["websocket"],
+                    headers={"JWT": director_bearer_token},
+                )
+                await ready
+        except BaseException:
+            # Also clean up on cancellation. Never leave a failed candidate
+            # connection reconnecting in the background with a rejected token.
+            if not ready.done():
+                ready.cancel()
+            elif not ready.cancelled():
+                ready.exception()
+            await self._sio.disconnect()
+            raise
 
     async def sio_disconnect(self) -> None:
         """Disconnects the WebSockets connection, if it has been created."""
