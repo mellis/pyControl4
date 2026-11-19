@@ -17,7 +17,9 @@ async def test_sio_connect_without_session():
     with patch.object(
         socketio_v4.AsyncClient, "__init__", return_value=None
     ) as mock_init, patch.object(
-        socketio_v4.AsyncClient, "register_namespace"
+        socketio_v4.AsyncClient,
+        "register_namespace",
+        side_effect=lambda namespace: namespace.ready.set_result(None),
     ), patch.object(
         socketio_v4.AsyncClient, "connect", new_callable=AsyncMock
     ):
@@ -37,7 +39,9 @@ async def test_sio_connect_with_session():
     with patch.object(
         socketio_v4.AsyncClient, "__init__", return_value=None
     ) as mock_init, patch.object(
-        socketio_v4.AsyncClient, "register_namespace"
+        socketio_v4.AsyncClient,
+        "register_namespace",
+        side_effect=lambda namespace: namespace.ready.set_result(None),
     ), patch.object(
         socketio_v4.AsyncClient, "connect", new_callable=AsyncMock
     ), patch.object(
@@ -50,5 +54,5 @@ async def test_sio_connect_with_session():
             connector=mock_connector, connector_owner=False
         )
         mock_init.assert_called_once_with(
-            ssl_verify=False, http_session=mock_http_session
+            ssl_verify=True, http_session=mock_http_session
         )
